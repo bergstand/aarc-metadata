@@ -1,4 +1,4 @@
-The Python3 script validate-AaRC medata.py can be used to validate entries in the AaRC metadata spreadsheet. Download the Google spreadsheet as an Excel spreadsheet, and give that as input to the script.
+The Python3 script validate-AaRC medata.py can be used to validate entries in the AaRC metadata spreadsheet. Download the Google spreadsheet as an Excel spreadsheet, and give that as input to the script. It currently does not report empty cells as invalid.
 
 ```
 usage: validate-AaRC-metadata.py [-h] [--sheets SHEETS] [--skip-urls] [--fields FIELDS] [--write-reports WRITE_REPORTS] excel_file
