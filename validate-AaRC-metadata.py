@@ -195,8 +195,6 @@ def accession_mt_exists(accession):
     # An accession is considered valid if:
     # 1. The request was successful (status < 400).
     # 2. The response content contains the <DocSum> tag (indicating a record was found).
-    # Non-existent IDs return status 200, but only an empty <eSummaryResult> or one 
-    # without a <DocSum> block.
     is_valid = status < 400 and "<DocSum>" in content
     
     tested_urls[cache_key] = is_valid
@@ -279,7 +277,7 @@ def parse_args():
         "--sheets",
         type=lambda s: [f.strip() for f in s.split(",") if f.strip()],
         default=None,
-        help="Optional: Comma-separated list of sheet names to validate (e.g., --sheets Data1,Data2)."
+        help="Optional: Comma-separated list of sheet names to validate (e.g., --sheets canids,capra)."
     )
     parser.add_argument(
         "--skip-urls",
@@ -290,13 +288,21 @@ def parse_args():
         "--fields",
         type=lambda s: [f.strip() for f in s.split(",") if f.strip()],
         default=None,
-        help="Optional: Comma-separated list of column names to validate, e.g., --fields col1,col2."
+        help="Optional: Comma-separated list of column names to validate, e.g., --fields samp_taxon_ID,sample_age."
     )
+    # Changed from --write-reports to --txt-reports
     parser.add_argument(
-        "--write-reports",
+        "--txt-reports",
         type=str,
         default=None,
-        help="Optional: Prefix for writing reports to files (e.g., 'errors'). Output files will be named <PREFIX>.<SHEET_NAME>.txt"
+        help="Optional: Prefix for writing tab-delimited reports to files (e.g., 'errors'). Output files will be named <PREFIX>.<SHEET_NAME>.txt"
+    )
+    # Modified flag for XLSX reports to accept a prefix
+    parser.add_argument(
+        "--xlsx-reports",
+        type=str,
+        default=None,
+        help="Optional: Prefix for writing a single consolidated Excel report (e.g., 'xlsx_errors'). The output file will be named <PREFIX>.xlsx"
     )
     return parser.parse_args()
 
@@ -308,15 +314,39 @@ def main():
     sheet_filters = args.sheets
     skip_urls = args.skip_urls
     selected_fields = args.fields
-    report_prefix = args.write_reports # Get the optional prefix
+    
+    # Updated report arguments: xlsx_report_prefix is now a string (or None)
+    txt_report_prefix = args.txt_reports 
+    xlsx_report_prefix = args.xlsx_reports
 
     ignore_sheets = ["README", "summary", "template"]
+
+    # Initialize dictionary to collect errors for XLSX output
+    all_errors_dfs = {} 
+
+    # Define the fixed header for the tab-delimited and DataFrame output
+    REPORT_HEADER = ["Sheet", "Line", "Sample ID", "Field Name", "Error Type", "Observed Value", "Error Details", "Allowed values"]
+    
+    # --- Define descriptive rules for types where "Allowed values" is typically empty ---
+    RULE_DESCRIPTIONS = {
+        "NUMBER": "Numeric value (integer or float).",
+        "DOI": "DOI format (e.g., doi.org/10.xxxx/xxx) resolving to a valid URL.",
+        "ACCESSION": "BioSample prefix required (e.g., SAME, SAMN, SAMD, SAMC) resolving to a valid BioSample entry.",
+        "ACCESSION_MT": "Valid NCBI Nucleotide Accession (e.g., OM925842.1) found in NCBI database.",
+        "ONTOLOGY_ENA_TECH": f"One of ENA allowed technologies: {', '.join(ENA_TECH_ALLOWED)}",
+        "ONTOLOGY_ENA_LIB": f"One of ENA allowed library strategies: {', '.join(ENA_LIB_ALLOWED)}",
+        "ONTOLOGY_COUNTRY": "NCBI-approved country (e.g., 'USA' or 'USA: state').",
+        "ONTOLOGY_UBERON": "Format: term, UBERON:ID (PURL must resolve).",
+        "TAXID": "Valid NCBI Taxonomy ID (integer) found via NCBI API.",
+        "FREE TEXT": "Any text is allowed."
+    }
+    # -------------------------------------------------------------------------------------
 
     try:
         excel_data = pd.ExcelFile(excel_file)
 
         if "field_definitions" not in excel_data.sheet_names:
-            print("Error: 'field_definitions' sheet is missing.")
+            print("Error: 'field_definitions' sheet is missing.", file=sys.stderr)
             sys.exit(1)
 
         field_definitions = pd.read_excel(excel_file, sheet_name="field_definitions")
@@ -329,11 +359,21 @@ def main():
         for _, row in field_definitions.iterrows():
             field_name = row.iloc[0]
             value_type = row["Validation type"]
-            allowed_values = row.get("Allowed values", None)
+            allowed_values_raw = row.get("Allowed values", None)
+
+            # Prepare the raw string from the "Allowed values" column for output
+            allowed_values_display_str = str(allowed_values_raw).strip()
+            # Clean up pandas/None artifacts for display
+            if allowed_values_display_str.lower() in ["nan", "none", ""]:
+                allowed_values_display_str = ""
+
             if pd.notnull(field_name) and pd.notnull(value_type):
                 validation_rules[field_name] = {
                     "value_type": value_type.strip().upper(),
-                    "allowed_values": [val.strip() for val in str(allowed_values).split(";")] if pd.notnull(allowed_values) else None
+                    # List of values for validation logic
+                    "allowed_values": [val.strip() for val in str(allowed_values_raw).split(";")] if pd.notnull(allowed_values_raw) else None,
+                    # Raw string for the output column, or a descriptive rule if empty
+                    "allowed_values_display": allowed_values_display_str or RULE_DESCRIPTIONS.get(value_type.strip().upper(), "")
                 }
 
         for sheet_name in excel_data.sheet_names:
@@ -342,32 +382,18 @@ def main():
 
             if sheet_filters and sheet_name not in sheet_filters:
                 continue
-
-            # --- Output Redirection Setup ---
-            error_file = sys.stdout
-            is_file_opened = False
-
-            if report_prefix:
-                report_filename = f"{report_prefix}.{sheet_name}.txt"
-                try:
-                    error_file = open(report_filename, 'w')
-                    is_file_opened = True
-                except IOError as e:
-                    # Print warning to STDERR so it's visible even if STDOUT is being piped
-                    print(f"Warning: Could not open report file '{report_filename}'. Writing to STDOUT instead. Error: {e}", file=sys.stderr)
-                    error_file = sys.stdout
-                    is_file_opened = False
-            # ---------------------------------
             
-            # This status message ALWAYS goes to STDOUT
-            print(f"Validating sheet: {sheet_name}")
+            print(f"INFO: Starting validation for sheet: {sheet_name}", file=sys.stderr)
 
             try:
                 sheet_data = pd.read_excel(excel_file, sheet_name=sheet_name)
 
                 if sheet_data.empty:
-                    print(f"Sheet '{sheet_name}' is empty. Skipping.", file=sys.stderr) # Print to stderr as a warning
+                    print(f"INFO: Sheet '{sheet_name}' is empty. Skipping.", file=sys.stderr)
                     continue
+
+                # List to hold errors for the CURRENT sheet
+                sheet_errors = [] 
 
                 for row_idx, row in sheet_data.iterrows():
                     for col_name, cell_value in row.items():
@@ -378,91 +404,106 @@ def main():
                             rule = validation_rules[col_name]
                             value_type = rule["value_type"]
                             allowed_values = rule["allowed_values"]
+                            # Use the stored display value for the final report column
+                            final_allowed_value = rule.get("allowed_values_display", "")
+
                             first_column_value = row.iloc[0] if not row.empty else "N/A"
 
                             if pd.isnull(cell_value):
                                 continue
 
+                            # --- Validation Logic Starts ---
+
                             if value_type == "FREE TEXT":
-                                pass
+                                pass # No validation for free text
 
                             elif value_type == "DEFINED VALUES":
                                 values = get_clean_values(cell_value)
-                                if not values:
-                                    continue
-                                invalid_values = [v for v in values if v.strip() not in [av.strip() for av in allowed_values]]
-                                if invalid_values:
-                                    # Format invalid values with double quotes
-                                    formatted_invalid = ', '.join(f'"{v}"' for v in invalid_values)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid value(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}. Expected one of: {', '.join(allowed_values)}.", file=error_file)
+                                if not values: continue
+                                
+                                allowed_set = set([av.strip() for av in allowed_values])
+                                
+                                for v in values:
+                                    if v.strip() not in allowed_set:
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid Defined Value",
+                                            "Observed Value": v,
+                                            "Error Details": "Observed value not in allowed list.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "NUMBER":
                                 values = get_clean_values(cell_value)
-                                if not values:
-                                    continue
-                                invalid_values = []
+                                if not values: continue
+                                
                                 for v in values:
                                     try:
                                         float(v)
                                     except (ValueError, TypeError):
-                                        invalid_values.append(v)
-                                if invalid_values:
-                                    # Format invalid values with double quotes
-                                    formatted_invalid = ', '.join(f'"{v}"' for v in invalid_values)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid numeric value(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}. Expected: numeric value(s).", file=error_file)
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid Numeric Value",
+                                            "Observed Value": v,
+                                            "Error Details": "Value cannot be parsed as a number.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "DOI" and not skip_urls:
                                 doi_urls = get_clean_values(cell_value)
-                                if not doi_urls:
-                                    continue
+                                if not doi_urls: continue
                                 
-                                # Fine-grained DOI validation
-                                invalid_dois = []
-                                prefix_error_message = 'Must start with "doi.org/", "www.doi.org/", "https://doi.org/", or "https://www.doi.org/"'
-                                url_unreachable_message = 'URL could not be reached/resolved'
+                                url_unreachable_message = 'URL could not be reached/resolved.'
 
                                 for original_url in doi_urls:
                                     resolved_url_for_check = None
                                     is_prefixed_correctly = False
 
-                                    # Check for valid HTTPS prefixes
                                     if original_url.startswith("https://doi.org/") or original_url.startswith("https://www.doi.org/"):
                                         is_prefixed_correctly = True
                                         resolved_url_for_check = original_url
-                                    # Check for scheme-less prefix (doi.org/ or www.doi.org/)
                                     elif original_url.startswith("doi.org/") or original_url.startswith("www.doi.org/"):
                                         is_prefixed_correctly = True
-                                        # Prepend https:// to make it a valid URL for the check
                                         resolved_url_for_check = "https://" + original_url
                                     
                                     if not is_prefixed_correctly:
-                                        # First check failed: Report prefix error
-                                        invalid_dois.append(f'"{original_url}" ({prefix_error_message})')
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid DOI Prefix",
+                                            "Observed Value": original_url,
+                                            "Error Details": "Should start with doi.org, www.doi.org, https://doi.org/ or https://www.doi.org/",
+                                            "Allowed values": final_allowed_value
+                                        })
                                         continue
                                     
-                                    # First check passed, now test URL existence
                                     if not url_exists(resolved_url_for_check):
-                                        # Second check failed: Report URL unreachable error
-                                        invalid_dois.append(f'"{original_url}" ({url_unreachable_message})')
-
-                                if invalid_dois:
-                                    # Output accumulated, detailed errors
-                                    formatted_invalid = '; '.join(invalid_dois)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid DOI value(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}.", file=error_file)
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Unresolved DOI URL",
+                                            "Observed Value": original_url,
+                                            "Error Details": url_unreachable_message,
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "ACCESSION" and not skip_urls:
                                 accession_values = get_clean_values(cell_value)
-                                
-                                if not accession_values:
-                                    continue
+                                if not accession_values: continue
                                 
                                 INSDC_PREFIXES = ("SAME", "SAMN", "SAMD")
                                 NGDC_PREFIXES = ("SAMC",)
-
-                                invalid_accessions = []
+                                
                                 for accession in accession_values:
                                     accession_upper = accession.upper()
                                     base_url = None
@@ -473,146 +514,245 @@ def main():
                                         archive_group = "EBI BioSamples"
                                     elif accession_upper.startswith(NGDC_PREFIXES):
                                         base_url = "https://ngdc.cncb.ac.cn/biosample/browse/"
-                                        # NGDC (formerly GSA)
                                         archive_group = "NGDC BioSample" 
                                     else:
-                                        expected_prefixes = ', '.join(INSDC_PREFIXES + NGDC_PREFIXES)
-                                        unrecognized_error = f'"{accession}" (Unrecognized accession prefix. Expected one of: {expected_prefixes})'
-                                        invalid_accessions.append(unrecognized_error)
-                                        continue # Move to next accession
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Unrecognized BioSample Accession Prefix",
+                                            "Observed Value": accession,
+                                            "Error Details": f"Unrecognized accession prefix.",
+                                            "Allowed values": final_allowed_value
+                                        })
+                                        continue
 
                                     full_url = f"{base_url}{accession}"
                                     if not url_exists(full_url):
-                                        # Report the specific accession and the URL that failed
-                                        invalid_accessions.append(f'"{accession}" (Unresolved in {archive_group} at {full_url})')
-                                
-                                if invalid_accessions:
-                                    # Output accumulated, detailed errors
-                                    formatted_invalid = '; '.join(invalid_accessions)
-                                    print(f"- Invalid accession(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}.", file=error_file)
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Unresolved BioSample Accession",
+                                            "Observed Value": accession,
+                                            "Error Details": f"URL failed to resolve in {archive_group}.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "ACCESSION_MT" and not skip_urls:
                                 accession_values = get_clean_values(cell_value)
-                                
-                                if not accession_values:
-                                    continue
-                                
-                                invalid_accessions = []
-                                # Use the dedicated function for ESummary content validation.
+                                if not accession_values: continue
                                 
                                 for accession in accession_values:
                                     if not accession_mt_exists(accession):
-                                        # Report the specific accession and the URL that failed
-                                        invalid_accessions.append(f'"{accession}" (Unresolved in NCBI Nucleotide database via E-utilities content check)')
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Unresolved NCBI Nucleotide Accession",
+                                            "Observed Value": accession,
+                                            "Error Details": "Record not found in NCBI Nucleotide database.",
+                                            "Allowed values": final_allowed_value
+                                        })
                                 
-                                if invalid_accessions:
-                                    # Output accumulated, detailed errors
-                                    formatted_invalid = '; '.join(invalid_accessions)
-                                    print(f"- Invalid accession(s) (NCBI Nucleotide) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}.", file=error_file)
-
 
                             elif value_type == "ONTOLOGY_ENA_TECH":
                                 values = get_clean_values(cell_value)
-                                if not values:
-                                    continue
-                                invalid_values = [v for v in values if not is_valid_ena_tech(v)]
-                                if invalid_values:
-                                    # Format invalid values with double quotes
-                                    formatted_invalid = ', '.join(f'"{v}"' for v in invalid_values)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid value(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}. Expected one of: {', '.join(ENA_TECH_ALLOWED)}.", file=error_file)
+                                if not values: continue
+                                
+                                for v in values:
+                                    if not is_valid_ena_tech(v):
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid ENA Technology",
+                                            "Observed Value": v,
+                                            "Error Details": "Observed value not in ENA allowed platform list.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "ONTOLOGY_ENA_LIB":
                                 values = get_clean_values(cell_value)
-                                if not values:
-                                    continue
-                                invalid_values = [v for v in values if not is_valid_ena_lib(v)]
-                                if invalid_values:
-                                    # Format invalid values with double quotes
-                                    formatted_invalid = ', '.join(f'"{v}"' for v in invalid_values)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid value(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}. Expected one of: {', '.join(ENA_LIB_ALLOWED)}.", file=error_file)
+                                if not values: continue
+                                
+                                for v in values:
+                                    if not is_valid_ena_lib(v):
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid ENA Library Strategy",
+                                            "Observed Value": v,
+                                            "Error Details": "Observed value not in ENA allowed library strategies list.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "ONTOLOGY_COUNTRY":
                                 values = get_clean_values(cell_value)
-                                if not values:
-                                    continue
-                                invalid_values = [v for v in values if not is_valid_country(v)]
-                                if invalid_values:
-                                    # Format invalid values with double quotes
-                                    formatted_invalid = ', '.join(f'"{v}"' for v in invalid_values)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid value(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}. Expected one of the countries listed here: https://www.ncbi.nlm.nih.gov/genbank/collab/country/", file=error_file)
+                                if not values: continue
+                                
+                                for v in values:
+                                    if not is_valid_country(v):
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid Country",
+                                            "Observed Value": v,
+                                            "Error Details": "Country part is not in NCBI allowed list.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
                             elif value_type == "ONTOLOGY_UBERON" and not skip_urls:
                                 values = get_clean_values(cell_value)
-                                if not values:
-                                    continue
-
-                                invalid_uberon_terms = []
+                                if not values: continue
+                                
                                 for entry in values:
                                     parts = [p.strip() for p in entry.split(",", 1)]
 
                                     if len(parts) != 2:
-                                        # Use double quotes around the entry and for the expected format
-                                        invalid_uberon_terms.append(f'"{entry}" (Incorrect format. Expected "term, UBERON:ID")')
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "UBERON Format Error",
+                                            "Observed Value": entry,
+                                            "Error Details": 'Incorrect format. Expected: "term, UBERON:ID".',
+                                            "Allowed values": final_allowed_value
+                                        })
                                         continue
 
                                     uberon_id_raw = parts[1].strip() 
                                     
                                     if not uberon_id_raw.startswith("UBERON:"):
-                                        # Use double quotes around the entry
-                                        invalid_uberon_terms.append(f'"{entry}" (Second part does not start with "UBERON:")')
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "UBERON ID Prefix Error",
+                                            "Observed Value": entry,
+                                            "Error Details": 'ID part does not start with "UBERON:".',
+                                            "Allowed values": final_allowed_value
+                                        })
                                         continue
                                     
-                                    # Replace ":" with "_" to get the PURL suffix
                                     purl_suffix = uberon_id_raw.replace(":", "_")
                                     purl_url = f"http://purl.obolibrary.org/obo/{purl_suffix}"
 
                                     if not url_exists(purl_url):
-                                        # Use double quotes around the entry
-                                        invalid_uberon_terms.append(f'"{entry}" (UBERON term did not resolve at {purl_url})')
-                                
-                                if invalid_uberon_terms:
-                                    # The terms are already formatted with quotes, so just join them
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid UBERON term(s) on row {row_idx + 1} ({first_column_value}), column '{col_name}': {'; '.join(invalid_uberon_terms)}.", file=error_file)
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Unresolved UBERON Term",
+                                            "Observed Value": entry,
+                                            "Error Details": f"UBERON term did not resolve at PURL.",
+                                            "Allowed values": final_allowed_value
+                                        })
                             
                             elif value_type == "TAXID" and not skip_urls:
                                 raw_taxids = get_clean_values(cell_value)
+                                if not raw_taxids: continue
                                 
                                 taxids = []
                                 for raw_id in raw_taxids:
-                                    # Remove ".0" suffix if present, which occurs when pandas reads integers 
-                                    # as floats due to NaN values in the column.
+                                    # Handle pandas reading integers as floats (e.g., 9606.0)
                                     if raw_id.endswith(".0"):
                                         taxids.append(raw_id[:-2])
                                     else:
                                         taxids.append(raw_id)
                                         
-                                if not taxids:
-                                    continue
-                                invalid_taxids = [taxid for taxid in taxids if not taxid_exists(taxid)]
-                                if invalid_taxids:
-                                    # Format invalid values with double quotes
-                                    formatted_invalid = ', '.join(f'"{taxid}"' for taxid in invalid_taxids)
-                                    # Output error to the designated file/stream
-                                    print(f"- Invalid NCBI Taxonomy ID on row {row_idx + 1} ({first_column_value}), column '{col_name}': {formatted_invalid}.", file=error_file)
+                                for taxid in taxids:
+                                    if not taxid_exists(taxid):
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Unresolved NCBI TaxID",
+                                            "Observed Value": taxid,
+                                            "Error Details": "Taxonomy ID could not be found via NCBI API.",
+                                            "Allowed values": final_allowed_value
+                                        })
 
-            finally:
-                # Close the file handle if we opened one
-                if is_file_opened:
-                    error_file.close()
+                # --- Handle Error Reporting for the current sheet ---
+                
+                if sheet_errors:
+                    
+                    # 1. Store for XLSX output if requested (using prefix check)
+                    if xlsx_report_prefix:
+                        error_df = pd.DataFrame(sheet_errors, columns=REPORT_HEADER)
+                        # Ensure sheet name is safe for Excel sheet name limit (31 chars)
+                        safe_sheet_name = sheet_name[:31]
+                        all_errors_dfs[safe_sheet_name] = error_df
+                        print(f"REPORT: Sheet '{sheet_name}' validation complete with {len(sheet_errors)} error(s). Errors stored for XLSX report.", file=sys.stderr)
+                    
+                    # 2. Handle TXT output if requested
+                    if txt_report_prefix:
+                        report_filename = f"{txt_report_prefix}.{sheet_name}.txt"
+                        report_destination_name = report_filename
+                        
+                        try:
+                            with open(report_filename, 'w') as error_file:
+                                print(f"REPORT: Sheet '{sheet_name}' validation complete with {len(sheet_errors)} error(s). Outputting to {report_destination_name}.", file=sys.stderr)
+                                # Print the header line
+                                print('\t'.join(REPORT_HEADER), file=error_file)
 
-            # This separator ALWAYS goes to STDOUT
-            print("-" * 40)
+                                for err in sheet_errors:
+                                    # Construct the tab-delimited line
+                                    line = '\t'.join(str(err.get(h, "")).replace('\t', ' ').replace('\n', ' ') for h in REPORT_HEADER)
+                                    print(line, file=error_file)
+                        except IOError as e:
+                            print(f"Warning: Could not open report file '{report_filename}'. Error: {e}", file=sys.stderr)
+                            
+                    # 3. Handle STDOUT (default behavior if no file output flags are used)
+                    if not txt_report_prefix and not xlsx_report_prefix:
+                        print(f"REPORT: Sheet '{sheet_name}' validation complete with {len(sheet_errors)} error(s). Outputting to STDOUT.", file=sys.stderr)
+                        print('\t'.join(REPORT_HEADER), file=sys.stdout)
+                        for err in sheet_errors:
+                            line = '\t'.join(str(err.get(h, "")).replace('\t', ' ').replace('\n', ' ') for h in REPORT_HEADER)
+                            print(line, file=sys.stdout)
+                            
+                else:
+                    print(f"INFO: Sheet '{sheet_name}' validation passed. No errors found.", file=sys.stderr)
+
+            except Exception as e:
+                print(f"Error reading or processing sheet '{sheet_name}': {e}", file=sys.stderr)
+
 
     except FileNotFoundError:
-        print(f"Error: The file '{excel_file}' was not found.")
+        print(f"Error: The file '{excel_file}' was not found.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"Error reading the Excel file: {e}")
+        print(f"Error reading the Excel file: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # --- Final step: Write consolidated XLSX report if requested (using prefix) ---
+    if xlsx_report_prefix and all_errors_dfs:
+        xlsx_filename = f"{xlsx_report_prefix}.xlsx"
+        print(f"\nINFO: Writing consolidated XLSX report to {xlsx_filename}...", file=sys.stderr)
+        
+        try:
+            # Use ExcelWriter to manage multiple sheets
+            with pd.ExcelWriter(xlsx_filename, engine='xlsxwriter') as writer:
+                for sheet_name, df in all_errors_dfs.items():
+                    # Write each DataFrame to a sheet named after the input sheet
+                    # Sheet names are already trimmed to 31 chars
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+            print(f"INFO: XLSX report successfully created: {xlsx_filename}", file=sys.stderr)
+        except Exception as e:
+            print(f"CRITICAL ERROR: Failed to write XLSX report to {xlsx_filename}. Error: {e}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
