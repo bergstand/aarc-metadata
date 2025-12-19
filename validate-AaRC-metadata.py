@@ -26,7 +26,7 @@ COUNTRY_ALLOWED = [
     "Antarctica", "Antigua and Barbuda", "Arctic Ocean", "Argentina", "Armenia", "Aruba",
     "Ashmore and Cartier Islands", "Atlantic Ocean", "Australia", "Austria", "Azerbaijan",
     "Bahamas", "Bahrain", "Baltic Sea", "Baker Island", "Bangladesh", "Barbados",
-    "Bassas da India", "Belarus", "Belgium", "Belize", "Benin", "Bermuda", "Bhutan",
+    "Bassas da India", "Belarus", "Belgium", "Benin", "Bermuda", "Bhutan",
     "Bolivia", "Borneo", "Bosnia and Herzegovina", "Botswana", "Bouvet Island", "Brazil",
     "British Virgin Islands", "Brunei", "Bulgaria", "Burkina Faso", "Burundi", "Cambodia",
     "Cameroon", "Canada", "Cape Verde", "Cayman Islands", "Central African Republic", "Chad",
@@ -220,6 +220,51 @@ def taxid_exists(taxid):
     tested_urls[taxid] = result
     return result
 
+def is_valid_biosample_accession_format(accession):
+    """
+    Uses regex to validate the BioSample accession format based on ENA guidance:
+    Starts with SAM, followed by one of [E, D, N, C] (case-insensitive), 
+    then an optional single uppercase letter (A or G), and finally one or more digits.
+    E.g., SAME12345678, SAMEA115399878, SAMC00000001.
+    """
+    # Pattern: ^SAM[EDNC][A-Z]?\d+$
+    # SAM: Literal 'SAM'
+    # [EDNC]: One of E, D, N (INSDC) or C (NGDC)
+    # [A-Z]?: Optional single uppercase letter (e.g., A for Assay, G for Group)
+    # \d+: One or more digits
+    pattern = re.compile(r"^SAM[EDNC][A-Z]?\d+$", re.IGNORECASE)
+    return bool(pattern.match(accession.strip()))
+
+def is_valid_c14_value(value):
+    """
+    Validates a single clean string value against the C14 rules:
+    - Exactly "Inf"
+    - Exactly "failed"
+    - A number (float or integer)
+    - A number preceded by ">"
+    """
+    v = str(value).strip()
+    
+    # Case 1 & 2: Check for special strings (case-sensitive as requested)
+    if v in ("Inf", "failed"):
+        return True
+    
+    # Prepare for numeric check
+    numeric_part = v
+    if v.startswith(">"):
+        numeric_part = v[1:].strip() # Remove '>' and strip whitespace
+    
+    # Check if the remaining part is numeric
+    if not numeric_part: # If it was just ">"
+        return False
+
+    try:
+        float(numeric_part)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def is_valid_ena_tech(value):
     return str(value).strip() in ENA_TECH_ALLOWED
 
@@ -331,13 +376,14 @@ def main():
     RULE_DESCRIPTIONS = {
         "NUMBER": "Numeric value (integer or float).",
         "DOI": "DOI format (e.g., doi.org/10.xxxx/xxx) resolving to a valid URL.",
-        "ACCESSION": "BioSample prefix required (e.g., SAME, SAMN, SAMD, SAMC) resolving to a valid BioSample entry.",
+        "ACCESSION": "BioSample prefix required (SAM[EDNC]) and format (e.g., SAMEA115399878) resolving to a valid BioSample entry.",
         "ACCESSION_MT": "Valid NCBI Nucleotide Accession (e.g., OM925842.1) found in NCBI database.",
         "ONTOLOGY_ENA_TECH": f"One of ENA allowed technologies: {', '.join(ENA_TECH_ALLOWED)}",
         "ONTOLOGY_ENA_LIB": f"One of ENA allowed library strategies: {', '.join(ENA_LIB_ALLOWED)}",
         "ONTOLOGY_COUNTRY": "NCBI-approved country (e.g., 'USA' or 'USA: state').",
         "ONTOLOGY_UBERON": "Format: term, UBERON:ID (PURL must resolve).",
         "TAXID": "Valid NCBI Taxonomy ID (integer) found via NCBI API.",
+        "C14": "Carbon-14 age, one of: numeric value (with optional > prefix), 'Inf', or 'failed'.",
         "FREE TEXT": "Any text is allowed."
     }
     # -------------------------------------------------------------------------------------
@@ -349,7 +395,7 @@ def main():
             print("Error: 'field_definitions' sheet is missing.", file=sys.stderr)
             sys.exit(1)
 
-        field_definitions = pd.read_excel(excel_file, sheet_name="field_definitions")
+        field_definitions = pd.read_excel(excel_data, sheet_name="field_definitions")
         field_definitions = field_definitions[
             ~field_definitions.iloc[:, 0].isnull() &
             ~field_definitions.iloc[:, 0].astype(str).str.startswith("#")
@@ -455,6 +501,23 @@ def main():
                                             "Allowed values": final_allowed_value
                                         })
 
+                            elif value_type == "C14":
+                                values = get_clean_values(cell_value)
+                                if not values: continue
+
+                                for v in values:
+                                    if not is_valid_c14_value(v):
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid C14 Value",
+                                            "Observed Value": v,
+                                            "Error Details": "Value must be a number (with optional '>' prefix), 'Inf', or 'failed'.",
+                                            "Allowed values": final_allowed_value
+                                        })
+
                             elif value_type == "DOI" and not skip_urls:
                                 doi_urls = get_clean_values(cell_value)
                                 if not doi_urls: continue
@@ -505,6 +568,22 @@ def main():
                                 NGDC_PREFIXES = ("SAMC",)
                                 
                                 for accession in accession_values:
+                                    
+                                    # --- Check format using Regex first ---
+                                    if not is_valid_biosample_accession_format(accession):
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 1,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col_name,
+                                            "Error Type": "Invalid BioSample Accession Format",
+                                            "Observed Value": accession,
+                                            "Error Details": "Accession does not match required SAM[EDNC][A-Z]?####+ format.",
+                                            "Allowed values": final_allowed_value
+                                        })
+                                        continue # Skip URL check if format is bad
+                                    # --- End Check ---
+
                                     accession_upper = accession.upper()
                                     base_url = None
                                     archive_group = None
@@ -516,6 +595,7 @@ def main():
                                         base_url = "https://ngdc.cncb.ac.cn/biosample/browse/"
                                         archive_group = "NGDC BioSample" 
                                     else:
+                                        # This should be caught by the regex check, but kept as a fallback.
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
                                             "Line": row_idx + 1,
