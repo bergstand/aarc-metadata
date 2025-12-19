@@ -3,7 +3,9 @@ The Python3 script validate-AaRC-metadata.py can be used to validate entries in 
 By default simply prints identified errors, but with optional flags these can be written to text files or to a multi-sheet Excel file.
 
 ```
-usage: validate-AaRC-metadata.py [-h] [--sheets SHEETS] [--skip-urls] [--fields FIELDS] [--txt-reports TXT_REPORTS] [--xlsx-reports XLSX_REPORTS] excel_file
+usage: validate-AaRC-metadata.py [-h] [--sheets SHEETS] [--skip-urls] [--fields FIELDS] [--txt-reports TXT_REPORTS]
+                                 [--xlsx-reports XLSX_REPORTS]
+                                 excel_file
 
 Validate metadata in an Excel file against 'field_definitions' sheet.
 
