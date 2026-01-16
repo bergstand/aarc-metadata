@@ -103,17 +103,19 @@ def url_exists(url):
         # Determine the connection type (HTTP or HTTPS)
         if scheme == 'https':
             # Use HTTPSConnection
-            conn = http.client.HTTPSConnection(netloc, timeout=5)
+            conn = http.client.HTTPSConnection(netloc, timeout=10)
         elif scheme == 'http':
             # Use HTTPConnection
-            conn = http.client.HTTPConnection(netloc, timeout=5)
+            conn = http.client.HTTPConnection(netloc, timeout=10)
         else:
             # Scheme not supported for this checker
             tested_urls[url] = False
             return False
 
         # Use a GET request for better compatibility with APIs/servers
-        conn.request("GET", path) 
+        # Add User-Agent to avoid being blocked by servers (e.g. NGDC) that reject bot-like requests
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        conn.request("GET", path, headers=headers)
         response = conn.getresponse()
         
         # Read the entire response body to allow connection to close properly
@@ -235,13 +237,13 @@ def is_valid_biosample_accession_format(accession):
     pattern = re.compile(r"^SAM[EDNC][A-Z]?\d+$", re.IGNORECASE)
     return bool(pattern.match(accession.strip()))
 
-def is_valid_c14_value(value):
+def is_valid_age_value(value):
     """
-    Validates a single clean string value against the C14 rules:
-    - Exactly "Inf"
-    - Exactly "failed"
+    Validates a single clean string value against the rules for age values:
     - A number (float or integer)
     - A number preceded by ">"
+    - Exactly "Inf"
+    - Exactly "failed"
     """
     v = str(value).strip()
     
@@ -311,12 +313,14 @@ def get_clean_values(cell_value):
 def parse_args():
     """Handles command-line arguments using argparse."""
     parser = argparse.ArgumentParser(
-        description="Validate metadata in an Excel file against 'field_definitions' sheet.",
+        description="Validate metadata in an Excel file or Google Sheet against 'field_definitions' sheet.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
         "excel_file",
-        help="Path to the Excel file to validate (e.g., metadata.xlsx)."
+        nargs="?",
+        default="https://docs.google.com/spreadsheets/d/1me-fjDmVRktAGRvThZuA9O1VX9s_ZYwox2jDbtOhEZI/",
+        help="Path to the Excel file (e.g., metadata.xlsx) or a Google Sheets URL.\nIf no file is given, the default is the AaRC metadata curation Google Sheet: https://docs.google.com/spreadsheets/d/1me-fjDmVRktAGRvThZuA9O1VX9s_ZYwox2jDbtOhEZI/"
     )
     parser.add_argument(
         "--sheets",
@@ -335,19 +339,22 @@ def parse_args():
         default=None,
         help="Optional: Comma-separated list of column names to validate, e.g., --fields samp_taxon_ID,sample_age."
     )
-    # Changed from --write-reports to --txt-reports
     parser.add_argument(
         "--txt-reports",
         type=str,
         default=None,
         help="Optional: Prefix for writing tab-delimited reports to files (e.g., 'errors'). Output files will be named <PREFIX>.<SHEET_NAME>.txt"
     )
-    # Modified flag for XLSX reports to accept a prefix
     parser.add_argument(
         "--xlsx-reports",
         type=str,
         default=None,
         help="Optional: Prefix for writing a single consolidated Excel report (e.g., 'xlsx_errors'). The output file will be named <PREFIX>.xlsx"
+    )
+    parser.add_argument(
+        "--ignore-incomplete",
+        action="store_true",
+        help="Optional: Do not include incomplete entries in the output (missing required fields)."
     )
     return parser.parse_args()
 
@@ -363,11 +370,21 @@ def main():
     # Updated report arguments: xlsx_report_prefix is now a string (or None)
     txt_report_prefix = args.txt_reports 
     xlsx_report_prefix = args.xlsx_reports
+    flag_incomplete = not args.ignore_incomplete
+
+    # Check if input is a Google Sheets URL and convert to export format if so
+    if excel_file.startswith(("http://", "https://")) and "docs.google.com/spreadsheets" in excel_file:
+        match = re.search(r"/d/([a-zA-Z0-9-_]+)", excel_file)
+        if match:
+            sheet_id = match.group(1)
+            excel_file = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+            print(f"INFO: Detected Google Sheets URL. Fetching as Excel export from: {excel_file}", file=sys.stderr)
 
     ignore_sheets = ["README", "summary", "template"]
 
     # Initialize dictionary to collect errors for XLSX output
     all_errors_dfs = {} 
+    sheet_stats_list = []
 
     # Define the fixed header for the tab-delimited and DataFrame output
     REPORT_HEADER = ["Sheet", "Line", "Sample ID", "Field Name", "Error Type", "Observed Value", "Error Details", "Allowed values"]
@@ -383,8 +400,9 @@ def main():
         "ONTOLOGY_COUNTRY": "NCBI-approved country (e.g., 'USA' or 'USA: state').",
         "ONTOLOGY_UBERON": "Format: term, UBERON:ID (PURL must resolve).",
         "TAXID": "Valid NCBI Taxonomy ID (integer) found via NCBI API.",
-        "C14": "Carbon-14 age, one of: numeric value (with optional > prefix), 'Inf', or 'failed'.",
-        "FREE TEXT": "Any text is allowed."
+        "AGE": "Sample age value, one of: numeric value (with optional > prefix), 'Inf', or 'failed'.",
+        "FREE TEXT": "Any text is allowed.",
+        "FREE TEXT OPTIONAL": "Any text is allowed."
     }
     # -------------------------------------------------------------------------------------
 
@@ -432,7 +450,7 @@ def main():
             print(f"INFO: Starting validation for sheet: {sheet_name}", file=sys.stderr)
 
             try:
-                sheet_data = pd.read_excel(excel_file, sheet_name=sheet_name)
+                sheet_data = pd.read_excel(excel_data, sheet_name=sheet_name)
 
                 if sheet_data.empty:
                     print(f"INFO: Sheet '{sheet_name}' is empty. Skipping.", file=sys.stderr)
@@ -440,8 +458,89 @@ def main():
 
                 # List to hold errors for the CURRENT sheet
                 sheet_errors = [] 
+                deferred_incomplete_errors = []
+
+                # Track seen identifiers for duplicate checking
+                duplicate_check_cols = ["samp_name", "biosamples_accession", "mt_accession"]
+                seen_identifiers = {col: {} for col in duplicate_check_cols}
+
+                # Determine required columns for this sheet (used for incomplete check and stats)
+                required_cols = []
+                for col in sheet_data.columns:
+                    if selected_fields and col not in selected_fields:
+                        continue
+                    if col in validation_rules:
+                        if validation_rules[col]["value_type"] != "FREE TEXT OPTIONAL":
+                            required_cols.append(col)
 
                 for row_idx, row in sheet_data.iterrows():
+                    
+                    # --- Check for Incomplete Entry ---
+                    if required_cols:
+                        missing_fields = [col for col in required_cols if pd.isnull(row[col])]
+                        if missing_fields:
+                            # Check curation_complete status
+                            is_marked_complete = False
+                            if "curation_complete" in sheet_data.columns:
+                                val = str(row["curation_complete"])
+                                if val.strip().lower() == "yes":
+                                    is_marked_complete = True
+
+                            first_column_value = row.iloc[0] if not row.empty else "N/A"
+                            
+                            if is_marked_complete:
+                                sheet_errors.append({
+                                    "Sheet": sheet_name,
+                                    "Line": row_idx + 2,
+                                    "Sample ID": first_column_value,
+                                    "Field Name": "-",
+                                    "Error Type": "Unintentionally incomplete",
+                                    "Observed Value": ";".join(missing_fields),
+                                    "Error Details": "curation_complete is set to 'yes', but there are missing fields, as listed here in the Observed Value column.",
+                                    "Allowed values": ""
+                                })
+                            elif flag_incomplete:
+                                deferred_incomplete_errors.append({
+                                    "Sheet": sheet_name,
+                                    "Line": row_idx + 2,
+                                    "Sample ID": first_column_value,
+                                    "Field Name": "-",
+                                    "Error Type": "Incomplete entry",
+                                    "Observed Value": ";".join(missing_fields),
+                                    "Error Details": "There are missing fields, as listed here in the Observed Value column.",
+                                    "Allowed values": ""
+                                })
+
+                    # --- Duplicate ID Check ---
+                    first_column_value = row.iloc[0] if not row.empty else "N/A"
+                    
+                    current_samp_name = "N/A"
+                    if "samp_name" in sheet_data.columns and pd.notnull(row["samp_name"]):
+                        current_samp_name = str(row["samp_name"]).strip()
+
+                    for col in duplicate_check_cols:
+                        if selected_fields and col not in selected_fields:
+                            continue
+                        if col in sheet_data.columns:
+                            cell_value = row[col]
+                            if pd.notnull(cell_value):
+                                clean_vals = get_clean_values(cell_value)
+                                for val in clean_vals:
+                                    if val in seen_identifiers[col]:
+                                        prev_line, prev_samp_name = seen_identifiers[col][val]
+                                        sheet_errors.append({
+                                            "Sheet": sheet_name,
+                                            "Line": row_idx + 2,
+                                            "Sample ID": first_column_value,
+                                            "Field Name": col,
+                                            "Error Type": "Duplicate identifier",
+                                            "Observed Value": val,
+                                            "Error Details": f"The identifier {val} has already been observed, at line {prev_line} (samp_name: {prev_samp_name})",
+                                            "Allowed values": ""
+                                        })
+                                    else:
+                                        seen_identifiers[col][val] = (row_idx + 2, current_samp_name)
+
                     for col_name, cell_value in row.items():
                         if selected_fields and col_name not in selected_fields:
                             continue
@@ -460,7 +559,7 @@ def main():
 
                             # --- Validation Logic Starts ---
 
-                            if value_type == "FREE TEXT":
+                            if value_type == "FREE TEXT" or value_type == "FREE TEXT OPTIONAL":
                                 pass # No validation for free text
 
                             elif value_type == "DEFINED VALUES":
@@ -473,7 +572,7 @@ def main():
                                     if v.strip() not in allowed_set:
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid Defined Value",
@@ -492,7 +591,7 @@ def main():
                                     except (ValueError, TypeError):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid Numeric Value",
@@ -501,18 +600,18 @@ def main():
                                             "Allowed values": final_allowed_value
                                         })
 
-                            elif value_type == "C14":
+                            elif value_type == "AGE":
                                 values = get_clean_values(cell_value)
                                 if not values: continue
 
                                 for v in values:
-                                    if not is_valid_c14_value(v):
+                                    if not is_valid_age_value(v):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
-                                            "Error Type": "Invalid C14 Value",
+                                            "Error Type": "Invalid AGE Value",
                                             "Observed Value": v,
                                             "Error Details": "Value must be a number (with optional '>' prefix), 'Inf', or 'failed'.",
                                             "Allowed values": final_allowed_value
@@ -538,7 +637,7 @@ def main():
                                     if not is_prefixed_correctly:
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid DOI Prefix",
@@ -551,7 +650,7 @@ def main():
                                     if not url_exists(resolved_url_for_check):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Unresolved DOI URL",
@@ -573,7 +672,7 @@ def main():
                                     if not is_valid_biosample_accession_format(accession):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid BioSample Accession Format",
@@ -598,7 +697,7 @@ def main():
                                         # This should be caught by the regex check, but kept as a fallback.
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Unrecognized BioSample Accession Prefix",
@@ -612,7 +711,7 @@ def main():
                                     if not url_exists(full_url):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Unresolved BioSample Accession",
@@ -629,7 +728,7 @@ def main():
                                     if not accession_mt_exists(accession):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Unresolved NCBI Nucleotide Accession",
@@ -647,7 +746,7 @@ def main():
                                     if not is_valid_ena_tech(v):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid ENA Technology",
@@ -664,7 +763,7 @@ def main():
                                     if not is_valid_ena_lib(v):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid ENA Library Strategy",
@@ -681,7 +780,7 @@ def main():
                                     if not is_valid_country(v):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Invalid Country",
@@ -700,7 +799,7 @@ def main():
                                     if len(parts) != 2:
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "UBERON Format Error",
@@ -715,7 +814,7 @@ def main():
                                     if not uberon_id_raw.startswith("UBERON:"):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "UBERON ID Prefix Error",
@@ -731,7 +830,7 @@ def main():
                                     if not url_exists(purl_url):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Unresolved UBERON Term",
@@ -756,7 +855,7 @@ def main():
                                     if not taxid_exists(taxid):
                                         sheet_errors.append({
                                             "Sheet": sheet_name,
-                                            "Line": row_idx + 1,
+                                            "Line": row_idx + 2,
                                             "Sample ID": first_column_value,
                                             "Field Name": col_name,
                                             "Error Type": "Unresolved NCBI TaxID",
@@ -765,46 +864,133 @@ def main():
                                             "Allowed values": final_allowed_value
                                         })
 
+                # Append deferred incomplete errors to the end of the list
+                sheet_errors.extend(deferred_incomplete_errors)
+
+                # --- Calculate Statistics for the Sheet ---
+                total_entries = len(sheet_data)
+                
+                # Calculate complete entries: defined as having any value in every field that is not FREE TEXT OPTIONAL
+                # (required_cols is already calculated above)
+                if required_cols:
+                    # Boolean Series indicating if each row is complete
+                    is_complete = sheet_data[required_cols].notnull().all(axis=1)
+                else:
+                    is_complete = pd.Series([True] * total_entries, index=sheet_data.index)
+                
+                num_complete = is_complete.sum()
+
+                # Determine if rows are marked as curation complete
+                if "curation_complete" in sheet_data.columns:
+                    cc_series = sheet_data["curation_complete"].astype(str).str.strip().str.lower()
+                    is_marked_yes = cc_series == "yes"
+                else:
+                    is_marked_yes = pd.Series([False] * total_entries, index=sheet_data.index)
+
+                # Calculate unintentionally incomplete
+                num_unintentionally_incomplete = 0
+                if required_cols:
+                    is_incomplete = ~is_complete
+                    num_unintentionally_incomplete = (is_incomplete & is_marked_yes).sum()
+
+                # Calculate entries without errors
+                lines_with_errors = set(err["Line"] for err in sheet_errors)
+                # Boolean Series indicating if each row is clean (no errors)
+                is_clean = pd.Series([(i + 2) not in lines_with_errors for i in sheet_data.index], index=sheet_data.index)
+                num_clean = is_clean.sum()
+                
+                # Calculate "Needs completion tickoff"
+                # Complete AND Clean AND NOT marked yes
+                num_needs_tickoff = (is_complete & is_clean & (~is_marked_yes)).sum()
+
+                # Calculate PASS: Complete AND Clean AND Marked Yes
+                num_pass = (is_complete & is_clean & is_marked_yes).sum()
+
+                # Calculate fraction
+                frac_pass = (num_pass / total_entries) if total_entries > 0 else 0.0
+
+                sheet_stats_list.append({
+                    "Sheet": sheet_name,
+                    "Entries": total_entries,
+                    "Complete": num_complete,
+                    "Unintentionally incomplete": num_unintentionally_incomplete,
+                    "Needs completion tickoff": num_needs_tickoff,
+                    "Error-free": num_clean,
+                    "PASS": num_pass,
+                    "PASS fraction": frac_pass,
+                    "Total errors": len(sheet_errors),
+                })
+
+                # Add "Needs completion tickoff" entries to the error list for reporting
+                # (Done after stats calculation so they don't count towards "Total errors" or affect "Clean" status)
+                tickoff_rows = sheet_data[is_complete & is_clean & (~is_marked_yes)]
+                for idx, row in tickoff_rows.iterrows():
+                    first_column_value = row.iloc[0] if not row.empty else "N/A"
+                    obs_val = ""
+                    if "curation_complete" in sheet_data.columns:
+                        val = row["curation_complete"]
+                        if pd.notnull(val):
+                            obs_val = str(val)
+                    
+                    sheet_errors.append({
+                        "Sheet": sheet_name,
+                        "Line": idx + 2,
+                        "Sample ID": first_column_value,
+                        "Field Name": "curation_complete",
+                        "Error Type": "Needs completion tickoff",
+                        "Observed Value": obs_val,
+                        "Error Details": "Entry is complete and error-free, but curation_complete is not set to 'yes'",
+                        "Allowed values": ""
+                    })
+                
+                # Sort errors: "Incomplete entry" last, then by line number
+                sheet_errors.sort(key=lambda x: (x["Error Type"] == "Incomplete entry", x["Line"]))
+
                 # --- Handle Error Reporting for the current sheet ---
                 
-                if sheet_errors:
-                    
-                    # 1. Store for XLSX output if requested (using prefix check)
-                    if xlsx_report_prefix:
-                        error_df = pd.DataFrame(sheet_errors, columns=REPORT_HEADER)
-                        # Ensure sheet name is safe for Excel sheet name limit (31 chars)
-                        safe_sheet_name = sheet_name[:31]
-                        all_errors_dfs[safe_sheet_name] = error_df
+                # 1. Store for XLSX output if requested (using prefix check)
+                if xlsx_report_prefix:
+                    error_df = pd.DataFrame(sheet_errors, columns=REPORT_HEADER)
+                    # Ensure sheet name is safe for Excel sheet name limit (31 chars)
+                    safe_sheet_name = sheet_name[:31]
+                    all_errors_dfs[safe_sheet_name] = error_df
+                    if sheet_errors:
                         print(f"REPORT: Sheet '{sheet_name}' validation complete with {len(sheet_errors)} error(s). Errors stored for XLSX report.", file=sys.stderr)
+                    else:
+                        print(f"REPORT: Sheet '{sheet_name}' validation passed. Empty error sheet stored for XLSX report.", file=sys.stderr)
+                
+                # 2. Handle TXT output if requested
+                if txt_report_prefix:
+                    report_filename = f"{txt_report_prefix}.{sheet_name}.txt"
+                    report_destination_name = report_filename
                     
-                    # 2. Handle TXT output if requested
-                    if txt_report_prefix:
-                        report_filename = f"{txt_report_prefix}.{sheet_name}.txt"
-                        report_destination_name = report_filename
-                        
-                        try:
-                            with open(report_filename, 'w') as error_file:
+                    try:
+                        with open(report_filename, 'w') as error_file:
+                            if sheet_errors:
                                 print(f"REPORT: Sheet '{sheet_name}' validation complete with {len(sheet_errors)} error(s). Outputting to {report_destination_name}.", file=sys.stderr)
-                                # Print the header line
-                                print('\t'.join(REPORT_HEADER), file=error_file)
-
-                                for err in sheet_errors:
-                                    # Construct the tab-delimited line
-                                    line = '\t'.join(str(err.get(h, "")).replace('\t', ' ').replace('\n', ' ') for h in REPORT_HEADER)
-                                    print(line, file=error_file)
-                        except IOError as e:
-                            print(f"Warning: Could not open report file '{report_filename}'. Error: {e}", file=sys.stderr)
+                            else:
+                                print(f"REPORT: Sheet '{sheet_name}' validation passed. Outputting empty report to {report_destination_name}.", file=sys.stderr)
                             
-                    # 3. Handle STDOUT (default behavior if no file output flags are used)
-                    if not txt_report_prefix and not xlsx_report_prefix:
+                            # Print the header line
+                            print('\t'.join(REPORT_HEADER), file=error_file)
+
+                            for err in sheet_errors:
+                                # Construct the tab-delimited line
+                                line = '\t'.join(str(err.get(h, "")).replace('\t', ' ').replace('\n', ' ') for h in REPORT_HEADER)
+                                print(line, file=error_file)
+                    except IOError as e:
+                        print(f"Warning: Could not open report file '{report_filename}'. Error: {e}", file=sys.stderr)
+                        
+                # 3. Handle STDOUT (default behavior if no file output flags are used)
+                if not txt_report_prefix and not xlsx_report_prefix:
+                    if sheet_errors:
                         print(f"REPORT: Sheet '{sheet_name}' validation complete with {len(sheet_errors)} error(s). Outputting to STDOUT.", file=sys.stderr)
                         print('\t'.join(REPORT_HEADER), file=sys.stdout)
                         for err in sheet_errors:
                             line = '\t'.join(str(err.get(h, "")).replace('\t', ' ').replace('\n', ' ') for h in REPORT_HEADER)
                             print(line, file=sys.stdout)
-                            
-                else:
-                    print(f"INFO: Sheet '{sheet_name}' validation passed. No errors found.", file=sys.stderr)
+                    else:
+                        print(f"INFO: Sheet '{sheet_name}' validation passed. No errors found.", file=sys.stderr)
 
             except Exception as e:
                 print(f"Error reading or processing sheet '{sheet_name}': {e}", file=sys.stderr)
@@ -817,6 +1003,52 @@ def main():
         print(f"Error reading the Excel file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # --- Process and Output Statistics ---
+    STATS_HEADER = ["Sheet", "Entries", "Complete", "Error-free", "PASS", "PASS fraction", "Total errors", "Unintentionally incomplete", "Needs completion tickoff"]
+    stats_df = pd.DataFrame(sheet_stats_list, columns=STATS_HEADER)
+
+    if not stats_df.empty:
+        # Calculate summary row
+        numeric_cols = ["Entries", "Complete", "Unintentionally incomplete", "Needs completion tickoff", "Error-free", "PASS", "Total errors"]
+        sums = stats_df[numeric_cols].sum()
+        
+        total_entries = sums["Entries"]
+        total_cc = sums["PASS"]
+        total_frac = (total_cc / total_entries) if total_entries > 0 else 0.0
+        
+        summary_row = pd.DataFrame([{
+            "Sheet": "Summary",
+            "Entries": int(sums["Entries"]),
+            "Complete": int(sums["Complete"]),
+            "Unintentionally incomplete": int(sums["Unintentionally incomplete"]),
+            "Needs completion tickoff": int(sums["Needs completion tickoff"]),
+            "Error-free": int(sums["Error-free"]),
+            "PASS": int(sums["PASS"]),
+            "PASS fraction": total_frac,
+            "Total errors": int(sums["Total errors"])
+        }])
+        
+        stats_df = pd.concat([stats_df, summary_row], ignore_index=True)
+
+    if txt_report_prefix:
+        stats_filename = f"{txt_report_prefix}.Validation_statistics.txt"
+        try:
+            stats_df.to_csv(stats_filename, sep='\t', index=False, float_format='%.2f')
+            print(f"REPORT: Validation statistics written to {stats_filename}", file=sys.stderr)
+        except IOError as e:
+            print(f"Warning: Could not open stats file '{stats_filename}'. Error: {e}", file=sys.stderr)
+
+    if xlsx_report_prefix:
+        # Prepend the statistics dataframe to the dictionary so it becomes the first sheet
+        new_dfs = {"Validation statistics": stats_df}
+        new_dfs.update(all_errors_dfs)
+        all_errors_dfs = new_dfs
+
+    if not txt_report_prefix and not xlsx_report_prefix and not stats_df.empty:
+        print("\n--- Validation Statistics ---", file=sys.stdout)
+        print(stats_df.to_string(index=False, float_format=lambda x: "{:.2f}".format(x)), file=sys.stdout)
+        print("-----------------------------\n", file=sys.stdout)
+
     # --- Final step: Write consolidated XLSX report if requested (using prefix) ---
     if xlsx_report_prefix and all_errors_dfs:
         xlsx_filename = f"{xlsx_report_prefix}.xlsx"
@@ -825,10 +1057,64 @@ def main():
         try:
             # Use ExcelWriter to manage multiple sheets
             with pd.ExcelWriter(xlsx_filename, engine='xlsxwriter') as writer:
+                workbook = writer.book
+                summary_border_fmt = workbook.add_format({'top': 2}) # Thick top border
+                legend_header_fmt = workbook.add_format({'bold': True})
+                fraction_fmt = workbook.add_format({'num_format': '0.00'})
+                summary_fraction_fmt = workbook.add_format({'top': 2, 'num_format': '0.00'})
+
                 for sheet_name, df in all_errors_dfs.items():
                     # Write each DataFrame to a sheet named after the input sheet
                     # Sheet names are already trimmed to 31 chars
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                    if sheet_name == "Validation statistics" and not df.empty:
+                        worksheet = writer.sheets[sheet_name]
+                        
+                        # Apply number format to "PASS fraction" column
+                        pass_frac_col_idx = -1
+                        if "PASS fraction" in df.columns:
+                            pass_frac_col_idx = df.columns.get_loc("PASS fraction")
+                            # Apply format to the column (width=None keeps default)
+                            worksheet.set_column(pass_frac_col_idx, pass_frac_col_idx, None, fraction_fmt)
+
+                        # The summary row is the last row of the dataframe
+                        # Excel row index = len(df) (since header is row 0)
+                        summary_row_idx = len(df)
+                        
+                        # Apply the border format to the summary row cells
+                        for col_idx, value in enumerate(df.iloc[-1]):
+                            val_to_write = value if pd.notnull(value) else ""
+                            
+                            # Use specific format for the fraction column in the summary row
+                            if col_idx == pass_frac_col_idx:
+                                worksheet.write(summary_row_idx, col_idx, val_to_write, summary_fraction_fmt)
+                            else:
+                                worksheet.write(summary_row_idx, col_idx, val_to_write, summary_border_fmt)
+                        
+                        # Add Legend
+                        legend_start_row = summary_row_idx + 2
+                        legend_content = [
+                            ["Column", "Meaning"],
+                            ["Sheet", "Name of the sheet validated"],
+                            ["Entries", "Total number of rows in the sheet"],
+                            ["Complete", "Entries with values in all required columns"],
+                            ["Error-free", "Entries with no validation errors"],
+                            ["PASS", "Entries that are complete, error-free, and marked 'curation_complete'='yes'"],
+                            ["PASS fraction", "Fraction of entries that are PASS"],
+                            ["Total errors", "Total count of validation errors found"],
+                            ["Unintentionally incomplete", "Entries marked 'curation_complete'='yes' but missing required fields"],
+                            ["Needs completion tickoff", "Entries that are complete and error-free and so would PASS, but are not marked 'curation_complete'='yes'"]
+                        ]
+                        
+                        for i, (col_name, meaning) in enumerate(legend_content):
+                            if i == 0:
+                                worksheet.write(legend_start_row + i, 0, col_name, legend_header_fmt)
+                                worksheet.write(legend_start_row + i, 1, meaning, legend_header_fmt)
+                            else:
+                                worksheet.write(legend_start_row + i, 0, col_name)
+                                worksheet.write(legend_start_row + i, 1, meaning)
+
             print(f"INFO: XLSX report successfully created: {xlsx_filename}", file=sys.stderr)
         except Exception as e:
             print(f"CRITICAL ERROR: Failed to write XLSX report to {xlsx_filename}. Error: {e}", file=sys.stderr)
