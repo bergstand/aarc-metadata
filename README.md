@@ -1,4 +1,4 @@
-The Python3 script validate-AaRC-metadata.py can be used to validate entries in the AaRC metadata spreadsheet. It can read input either as a Excel file, or directly from a Google Sheets URL. If not input file is given, the default is to read the AaRC metadata curation Google sheet.
+The Python3 script validate-AaRC-metadata.py can be used to validate entries in the AaRC metadata spreadsheet. It can read input either as an Excel file, or directly from a Google Sheets URL. If no input file is given, the default is to read the AaRC metadata curation Google sheet.
 
 By default simply prints identified errors, but with optional flags these can be written to text files or to a multi-sheet Excel file. 
 
